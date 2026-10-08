@@ -50,14 +50,12 @@ adb shell ls -l /sys/kernel/btf/vmlinux        # 可读则可在真机侧交叉�
 
 ### 怎么拿到官方直链
 
-各家入口不同，但都是「厂商下载接口 → 固件 ZIP 直链」两步，脚本化即可：
+厂商专用的只有「查到 URL」这一步：各家一个下载中心 / OTA 接口，抓一次包就能脚本化
+（注意国行站常是独立域名和独立的产品 ID 空间，别拿全球站的 ID 去查）。
 
-- **ASUS（ROG / ZenFone）**：`references/asus-firmware-url.sh "<机型名>" [cn|global]`。
-  国行必须走 `.com.cn` 三件套（`odinapi.asus.com.cn` → `www.asus.com.cn/support/webapi/ProductV2/GetPDBIOS`
-  → `dlcdnets.asus.com.cn`），与全球站是不同的产品 ID 空间。
-- **其他厂商**：先找「机型 → 版本列表 → 直链」的那个接口，拿到的 URL 直接交给 extractor。
-  厂商专用的只有「怎么查到 URL」这一步；**拿到 URL 之后的远程 Range 提取 extractor 已内置**，
-  不需要再写一遍抓包脚本。
+**拿到 URL 之后不必重写提取逻辑** —— ZIP 中央目录 → payload manifest → Range 只取
+boot 分区，extractor 已内置。只有需要留提取证据（manifest、分区哈希、实际下载字节数）
+时才单独跑提取脚本。
 
 **必须记录**：OTA URL、包内 `boot` 目标分区哈希、重建出的 `boot.img` / `kernel.Image` 的
 SHA-256。重建哈希与 manifest 目标哈希一致，才算"这确实是这台机器的镜像"。
