@@ -221,6 +221,35 @@ nm vmlinux.elf | grep -wE '_text|init_task|init_cred|empty_zero_page|root_task_g
 `Download/ghostlock-debug-log/<时间>/*.log.txt`，同目录的 `profile.conf` / `profile.bin`
 是本次真正生效的配置 —— **用它校验加载的就是你写的那份**，不要只看源文件。
 
+### 两个不在 profile 里、但决定成败的变量
+
+静态核对（阶段 3）管的是"配置对不对"。阶段 4 失败时，**先怀疑这两个，它们和配置正确性无关**：
+
+| 变量 | 实测影响（ROG 9 Pro `6.6.127`，同一份 conf） |
+|---|---|
+| **CPU 对** | cpu4/5（3.53 GHz 簇）：W1 的字节**永不落地**，15/15 失败，另一次运行直接 kernel panic。cpu6/7（两颗 4.32 GHz 超大核）：W1/W2 都过，2/2 成功 |
+| **是否冷机** | 同样 cpu6/7：冷机（uptime 54 s）6 次 route **0 次** `prepare_kernel_page` 重试、23 s 完成、KernelSnitch 泄漏失败 **0 次**；开机 36 分钟后 **18 次**重试、60 s、泄漏失败 **15 次** |
+
+所以：**冷机不是形式要求，是有实测数据的性能开关**；每次门禁前重启，别省。
+而 CPU 对是 app 按 CPU 簇自动配对给的默认值，**默认那对可能根本不可用**。
+
+**门禁找到可用的那一对之后，把它写进 profile**，否则下一个人（包括三个月后的你）
+还会从那个会 panic 的默认值开始：
+
+```hocon
+execution {
+  recommended_cpus {
+    main = 6
+    consumer = 7
+  }
+}
+```
+
+用户在首页手选的 `selected_cpus` 仍然优先于它；`app/src/main/assets/kernel_profiles/`
+里 `5.15.167-…` 和 `6.1.145-…` 两份都带这一项，注释写明了同样的理由。
+手选会存进 SharedPreferences，**是粘着的** —— 下次运行还是上次那对，核对日志里的
+`cpu pair:` 行，别凭记忆。
+
 ### 怎么判读（别把预期行为当失败）
 
 | 现象 | 含义 |
@@ -231,9 +260,12 @@ nm vmlinux.elf | grep -wE '_text|init_task|init_cred|empty_zero_page|root_task_g
 | `child is root!` / `exploit complete` | 在 handoff **之前**打印，不能当终点（收早了会打断 ksu 加载） |
 | 喷洒阶段中止 | 此时**尚无任何内核写入**，设备安全，秒级重试 |
 | route 内卡死 | 整机僵住 → 看门狗复位，约 1 分钟 |
+| **`prepare_kernel_page` 每次都 `ok attempt=1`，但写从不落地** | **假成功签名** —— 堆准备锁到了错的页。先换 CPU 对，见下 |
+| `prepare_kernel_page` 大量 `retry n/4`、偶尔耗尽，但落地了 | 正常（非冷机的典型样子）。不是配置问题 |
+| `KernelSnitch mm_struct leak failed` 反复出现 | 同上，冷机下归零。**不要**去填 `kernelsnitch.mm_struct_sz`（陷阱 T4） |
 | **`route_done success=1` 却 `W1: SELinux attempt N/N` 全败** | **原语可用但写偏了**，见下 |
 
-#### `route` 成功而 `W1` 失败 —— 单独一类，别当成不稳定
+#### `route` 成功而 `W1` 失败 —— 先分清竞态还是地址错
 
 ```
 prepare_kernel_page ok attempt=1
@@ -242,9 +274,44 @@ W1: SELinux attempt 15/15
 [-] Write 1 failed
 ```
 
-这不是概率问题（15/15 稳定失败），是**地址错**。W1 写 `selinux_state.enforcing := 0`
-然后从用户态读 SELinux 实际状态来验（`victim_process.cpp:204` → `attack::check_selinux_off()`），
-所以"写了但状态没变"= 那一字节落在别处。按下面顺序排，每步都留证据：
+**先搞清 W1 是怎么验的，否则会把竞态误判成地址错。**
+W1 写 `selinux_state.enforcing := 0`，验证是 `attack::check_selinux_off()`
+（`attack/ops.hpp`）：它 `open("/sys/fs/selinux/enforce")`，**打不开就返回 0**。
+enforcing 状态下 `untrusted_app` 被 SELinux 拦住读不到这个文件，所以
+"**能打开**"本身就是写落地的证明 —— 这个判据是可靠的，不存在"写对了但验错了"。
+
+反过来说，失败只说明那一次没写进去，**不说明地址错**。
+
+**第一步永远是：同一次开机里再跑一遍。**
+`attempt N/N` 全败看着像稳定失败，其实不是 —— 15 次尝试共用同一次喷洒出来的页，
+那一次布局不对就会 15 次全废。实测：ROG 9 Pro 用**同一份 conf**、**同一次开机**
+（`uptime` 16003 s 与 16278 s，相隔 275 s）跑两次，第一次 W1 15/15 全败，
+第二次 W1 一次就过。
+
+> 这一条同时是最强的地址排除法：**同一次开机里地址是常量**。
+> 若 `kernel_phys_load` / `phys_offset` / 字段语义任一项错，W1 在这次开机里**永远**
+> 不可能通过。只要见过一次通过，整类地址假设（含 EFI stub 物理 KASLR）当场出局，
+> 不必再去读 iomem、算物理基址。**先花 3 分钟重跑，别花 3 小时算地址。**
+
+**第二步：换另一簇的 CPU 对。** 这是实测里真正的判别量。
+ROG 9 Pro 上 cpu4/5 与 cpu6/7 的差别是：
+
+| | cpu4/5（3.53 GHz 簇） | cpu6/7（4.32 GHz 超大核） |
+|---|---|---|
+| `prepare_kernel_page` | **15/15 全是 `ok attempt=1`** | 大量 retry，偶尔耗尽 |
+| `route_done` | `success=1`（15 次） | `success=1` |
+| W1 的字节是否落地 | **从不** | 落地 |
+
+4/5 上堆准备"一次就成"却永远写不进去；6/7 上堆准备很费劲但写是真的。
+**"每次都一次就成"反而是坏信号** —— 它说明 `prepare_kernel_page` 在误报，
+锁到的不是我们要的页。同一台机器上这也解释了另一次运行的 kernel panic：
+往错页写一个指针就是现成的 panic 源。
+
+> 怎么换：app 首页的 CPU 选择器。优先试**另一个频率簇**的相邻一对
+> （`/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq` 看簇边界）。
+> 找到可用的那一对后写进 profile 的 `execution.recommended_cpus`（见本阶段开头）。
+
+只有在**换过 CPU 对、跨多次冷机**都卡在 W1 时，才按下面顺序查地址，每步都留证据：
 
 1. **把地址链路算一遍，和日志里的 `target=` 对比。**
    `address_space.cpp` 的 `data_alias_checked()`：
@@ -260,6 +327,31 @@ W1: SELinux attempt 15/15
    若那个验证写的是 scratch 位置而非本次 target，则它只证明原语可用，**不**证明 target 落地。
 5. 以上全对还失败 → 怀疑**内核物理落点与 `kernel_phys_load` 不一致**（陷阱 T9 的第二半）。
 
+#### W1 过了，之后黑屏 / 整机复位 —— 换一类问题
+
+W1 一旦通过，地址链路和字段语义就都被证明了，**后面的失败是别的原因**。
+先确认是 panic 还是卡死：
+
+```sh
+adb shell getprop ro.boot.bootreason          # kernel_panic / reboot,...
+adb shell getprop persist.sys.boot.reason.history   # 带 epoch，能和日志对时刻
+```
+
+`kernel_panic` 说明内核主动崩了（不是看门狗静默卡死）。
+
+**先排除 CPU 对**：如果同一配置也出现过"W1 全败"，那 panic 和 W1 失败很可能是**同一个
+根因** —— 堆准备误报成功、写落在随机物理页，运气不同就分别表现为"没反应"和"崩机"。
+ROG 9 Pro 就是这样：cpu4/5 一次 W1 全败、一次 panic；换 6/7 后两种都消失。
+**先换 CPU 对重跑，再往下查。**
+
+CPU 对换过仍 panic，才查 **W1 之后到崩之前**那几步都写了什么。W1 之后依次是：W1b（scratch / resident 修复）→ 任务发现
+（打印 `child_task=0x…`）→ W2b（vr.ko tag 清除，见 T12）→ W2a（`cred := init_cred`）。
+这几步里 W1b 和 W2b 都带**盲写**，且 W2 的 target 依赖任务发现的结果 —— 任务发现
+找错了 task，W2 就是往随机内核地址写一个指针，panic 完全合理。
+
+要定位到具体哪一行，**必须有本次运行的 trace**，而 panic 会把设备上那份连目录一起
+抹掉（T8）—— 所以这类运行**一定要先挂上 `gate_watch.sh`** 再点运行。
+
 单次 PASS ≠ 稳定。同配置跑满约 15 次之前，成功率的变化都按噪声处理。
 
 ## 阶段 5 · 落库与归档
@@ -271,8 +363,16 @@ jq . app/src/main/assets/kernel_profiles/index.conf
 ./gradlew :app:testDebugUnitTest :app:assembleDebug
 ```
 
+落库前再确认三件事：
+
+1. **profile 带上了门禁验证过的 `execution.recommended_cpus`**（陷阱 T13）。
+   没有这一项的 profile 等于把别人推到 app 的默认 CPU 对上，那一对可能会 panic。
+2. **成功率跑满**（同配置约 15 次）。单次 PASS 不够。
+3. 文件头的 `UNVERIFIED CANDIDATE` 字样换成门禁结论。
+
 门禁记录按 `docs/analysis/device-gates/*.md` 的格式归档，必须含：设备 / 固件 / 内核三元身份、
 镜像与 profile 的 SHA-256、生效 `profile.conf` 快照、每轮运行表、结论与保留项。
+**失败的运行也要写**，而且要写清是怎么被排除的 —— 门禁记录的价值一半在失败那几行。
 
 **脱敏**：原始 dmesg 含 USB 序列号、已安装包名等环境信息，不整份公开；只放 stage 行与内核地址。
 
@@ -289,10 +389,13 @@ jq . app/src/main/assets/kernel_profiles/index.conf
 | T5 | `--allow-missing` 的 0 进了 profile | 搜候选里的 `= 0` | 未解析符号被写成 0，看着像填好了。用不到的 route 字段整条省掉，不写 0 或占位值（`PROFILE_SCHEMA.md` §2） |
 | T6 | 用第三方镜像站的包提取 | 阶段 1 的哈希链 | 只用能与 OTA manifest 目标哈希对上的镜像 |
 | T7 | 只看源 conf、不看生效快照 | 对比设备上的 `profile.conf` | app 会补 `execution` 默认值；差异必须能逐项解释 |
-| T8 | 非正常复位回滚设备侧日志 | 日志尾部出现 NUL / 内容回退 | f2fs checkpoint 行为；关键日志流到主机，别只存设备。用 `scripts/gate_watch.sh`（见下），它带落盘预检和复位自动重连 |
+| T8 | **panic / 复位会让本次运行的 trace 整份消失，而 `logcat` 里根本没有 trace** | panic 之后 `adb pull ghostlock-debug-log` 回来只有**上一次**的目录，本次那个时间戳目录不存在；`grep prepare_kernel_page logcat.log` 为 0 行 | 两件事都要知道：①**exploit 的 trace 不进 logcat**。app 的 `<k>` 行和 native 的 `[spray]` / `prepare_kernel_page` / `=== W1` 只写进 app 自己的 `ghostlock-debug-log/<时间戳>/*.log.txt`，logcat 里关于 ghostlock 只有 auditd 的 avc 回显 —— 光抓 logcat 等于什么都没抓。②那个文件**每行 flush 但不 fsync**（`DebugAttackLog.append`）且经 MediaStore 创建，panic 后 f2fs 回滚到上一个 checkpoint，**连目录一起没了**（实测：panic 那次一个字节都没留下）。<br>所以必须在设备还活着时就把它轮询快照到主机：`scripts/gate_watch.sh` 现在同时抓两路（logcat 抓 panic / avc / 掉线时刻，快照器抓 trace），并且只在快照变长时替换、换新运行目录时重置基线。logcat 仍要抓 —— 它是唯一能看到内核 panic 行和复位时刻的那一路。<br>**别指望 pstore 兜底**：实测这台机器 `/sys/fs/pstore` 对 shell 不可读，而 app 成功后自己 dump 出来的 `pstore/` 目录是**空的**（没有可读的 ramoops），所以 panic 那次连内核侧现场都没有。主机侧快照是唯一的记录 |
 | T9 | `kernel_phys_offset` 缺失 → 悄悄用编译默认 `P0_PHYS_OFFSET`（`0x80000000`） | `address_space.cpp:86`；日志里的 `target=` 反推 | 未 root 时 `/proc/iomem` 和 `/proc/device-tree/*/reg` 都读不到，**但不要猜也不要照抄别家 profile**：跑 `scripts/xbl_memory_map.py <xbl_config.img>` 把 bootloader 的整张内存图读出来。最低区段基址就是 `kernel_phys_offset` 候选，同时能独立印证 `kernel_phys_load`。<br>注意**两件不同的事**：①`phys_offset`（DRAM 基址）对不对；②`kernel_phys_load` 是否等于内核**实际运行**的物理基址 —— `CONFIG_RANDOMIZE_BASE=y` + `CONFIG_EFI_STUB=y`（高通 XBL 即 UEFI）下 EFI stub 可能把 Image 搬到随机物理地址，那时 bootloader 的静态保留区**不是**运行地址。②目前只有 root 后的 `/proc/iomem`（`--iomem <dump>`，看 `Kernel code` 起始）能判 |
 | T10 | app 与 extractor 不同分支 → profile 被判 `unknown top-level key` | app 报"配置需要修正"，而几何字段其实都在 | 两者必须来自**同一分支**。实例：vr.ko 中和（`recommend_vr_guard` / `vr_guard`）只在上游 `vr-ko-bypass-dev`，官方 `pre-release` 的 APK 是从 `main` 构建的，`ProfileResolver.KnownTopLevel` 里没有这两个键 → `validateMerged` 报错拦住运行。要么用同分支自建 APK（CI `workflow_dispatch` 即可，不必本地装 SDK/NDK），要么另存一份去掉该段的变体 conf |
 | T11 | 把编辑器显示的 `null` 行当成"必须填的错误" | 对照 `ProfileResolver` 的 `RequiredTopLevel` / `RequiredTaskStruct` / `RequiredCred` / `RequiredOffset` 四张清单 | app 会把 profile **未携带**的字段渲染成可编辑的 `null` 行（`AndroidProfileConfigController` 里 `completeProfileFields` 的注释写明了）。`kernel_phys_offset`、`kernelsnitch.mm_struct_sz`、`cred.usage_offset`、`cred.refN_*` 都属于这一类 —— **不在必填清单里，填进去反而写入错值**。真正被拦住的只看日志的 `invalid=` 和红色标记 |
+| T12 | vr.ko tag 清除那段会在 `/proc/modules` 读不到时**默认"假设已加载"**，然后按 vivo 6.1 推出来的偏移对子任务做两次盲写 | 日志有没有 `vr.ko not loaded; skipping tag clear`；`adb shell cat /proc/modules \| awk '{print $1}' \| grep -i '^vr'` | `cve_2026_43499_backend.cpp` 的 W2b：`vr_needed` 在 `fopen("/proc/modules")` 失败时**取 1**，接着零写 `child_task+0x00`（thread_info.flags）和 `(child_task+VR_TAG_B_OFF)&~7`（默认 `0x2c`→对齐到 `0x28`）。这两个偏移来自**已验证的 vivo 6.1 树**，源码注释自己写着「VERIFY ON-DEVICE」。非 vivo 的 6.6 上 `task_struct+0x28..0x2f` 是什么完全没保证，盲零写是现成的 panic 源。<br>好消息是这段排在 W1 之后，W1 成功后 SELinux 已 permissive，`/proc/modules` 读得到 → 没有 `vr`/`vr_` 前缀模块时 `vr_needed=0` 整段跳过。所以**先确认日志里有 `not loaded; skipping`**；若该行缺失或显示 `loaded`，而设备又不是 vivo，就是在无谓地冒 panic 风险 |
+| T13 | profile 不带 `execution.recommended_cpus` → app 用按簇自动配对的默认值，而**默认那对可能根本不可用** | 日志的 `cpu pair: main=N consumer=M` 和你以为的不一样；或者门禁一直过不去而换 CPU 对就好了 | 门禁验证出可用的那一对之后**写进 profile**。实例：ROG 9 Pro 的默认 4/5 会让 W1 永不落地并曾导致 kernel panic，6/7 才可用；conf 里不写这一项，等于把下一个人推到会 panic 的那条路上。注意 app 把 `recommended_cpus` 当"默认选中项"而非强制值，用户手选的 `selected_cpus` 仍然优先，而且手选**会存进 SharedPreferences 粘住** —— 每次都核对日志里的 `cpu pair:` 行，别凭记忆 |
+| T14 | 多台设备（或一台走 USB + 无线两路）同时连着，`adb` 命令打到了错的那台 | 读出来的 `uname -r` / 文件路径莫名其妙对不上 | 所有 `adb` 都带 `-s <序列号>`。`gate_watch.sh` 会在检测到多于一台在线时直接拒绝运行并列出设备，用 `GL_SERIAL=` 指定。不变量 1（`uname -r` 逐字符核对）是最后一道防线，实测确实拦住过一次 |
 
 ## 随带脚本
 
@@ -316,13 +419,28 @@ python3 -I scripts/xbl_memory_map.py rog9_xbl/xbl_config.img
 ### `gate_watch.sh` — 阶段 4 的主机侧记录器（app 流程）
 
 ```sh
-GL_CONF=~/Downloads/<uname-r>.conf bash scripts/gate_watch.sh cold-boot-1
+GL_CONF=~/path/<uname-r>.conf bash scripts/gate_watch.sh cold-boot-1
+GL_SERIAL=<序列号>                 # 多台设备连着时必须给，否则脚本拒绝运行
+GL_OUT_ROOT=<目录> GL_POLL_SEC=0.5 # 可选
 ```
 
+**先起脚本，再点运行。** 反过来也还能救（快照器无条件跟最新的 run 目录），
+但收尾时要核一眼它打印的 trace 来源时间戳是不是本次。
+
 只读前置检查（从 conf 的 `release` 字段取期望 `uname -r` 并逐字符核对、conf 哈希本地 vs 设备、
-管理器 app 是否在位、KernelSU 是否已加载、启动时长是否像冷机）→ logcat 流式落盘
-**并预检确认真的在涨** → 设备复位自动重连 → Ctrl-C 收尾时自动拉设备侧
-`ghostlock-debug-log/`、diff 生效 `profile.conf`（陷阱 T7）、打印关键行摘要。
+管理器 app 是否在位、KernelSU 是否已加载、启动时长是否像冷机、上次启动原因是否 `kernel_panic`）
+→ 挂**两路**记录 → 设备复位自动重连 → Ctrl-C 收尾时拉设备侧 `ghostlock-debug-log/`、
+diff 生效 `profile.conf`（陷阱 T7）、打印关键行摘要与 trace 末尾、再打印 logcat 里的内核
+panic / oops / 看门狗行。
+
+两路分别是（为什么必须两路见陷阱 T8）：
+
+| 落盘文件 | 内容 | 为什么需要 |
+|---|---|---|
+| `device-trace.log` | **exploit 的全部输出**（`<k>` / `[spray]` / `prepare_kernel_page` / `=== W1` …） | 这些**只**写进设备上的 `ghostlock-debug-log/<时间戳>/*.log.txt`，而 panic 后 f2fs 会把那个目录整份回滚掉。脚本按 `GL_POLL_SEC`（默认 0.5 s）轮询快照，只在变长时替换，设备侧回滚伤不到主机这份 |
+| `logcat.log` | 内核 panic / oops / 看门狗、auditd 的 avc denied、掉线与重连时刻 | 这一路**没有** exploit 的任何输出，但 panic 行和复位时刻只在这里 |
+
+跑之前它会打印被忽略的基线路径（上一次运行的 trace），点运行后新目录一出现就开始收并增量打印。
 
 CLI 流程（`--load-prebuilt-profile`）不要用它：那边脚本是父进程，可以在
 `prepare_kernel_page retry` 处就地 abort 重摇；app 流程里控制权不在脚本手里。
