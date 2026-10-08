@@ -30,9 +30,37 @@ adb shell cat /proc/version             # 构建标志（见陷阱 T3）+ clang 
 adb shell getprop | grep -Ei 'ro.product.(model|device|name)|ro.board.platform|ro.build.(id|version.security_patch|fingerprint)'
 adb shell cat /proc/sys/kernel/kptr_restrict   # 2 → /proc/kallsyms 全零，别指望它
 adb shell ls -l /sys/kernel/btf/vmlinux        # 可读则可在真机侧交叉验证结构偏移
+adb pull /proc/config.gz                       # 常常是**唯一**可读的那个，见下
 ```
 
 把这些原样写进本次适配记录。后面每个结论都要能回指到其中某一行。
+
+**未 root 时实际能读到什么**（ASUS ROG 9 Pro 国行 / Android 16 实测，别预设能读）：
+
+| 来源 | 结果 | 影响 |
+|---|---|---|
+| `uname -r` / `/proc/version` / `getprop` | 可读 | 身份核对照常做 |
+| **`/proc/config.gz`** | **可读** | 见下，价值很高 |
+| `/proc/sys/kernel/kptr_restrict` | denied | — |
+| `/sys/kernel/btf/vmlinux` | denied | **C3 的设备侧交叉验证做不了**，改用阶段 3 的 `init_task` 语义自检 |
+| `/proc/kallsyms` | denied | 符号只能从镜像恢复 |
+| `/proc/iomem` | denied | **`kernel_phys_offset` 取不到**，见陷阱 T9 |
+| `/proc/device-tree/*/reg`（含 `memory`） | denied（SELinux；目录能列，属性读不了） | 同上 |
+| `/sys/kernel/notes`（GNU build-id） | denied | 内核二进制同一性只能靠别的证据 |
+
+`/proc/config.gz` 为什么值钱：`CONFIG_IKCONFIG` 把**同一份** config 既以它暴露，
+也以 gzip 块嵌在镜像的 `IKCFG_ST`…`IKCFG_ED` 之间。所以它能做两件别处做不到的事：
+
+1. **证明"跑的内核就是这个镜像的构建"**（设备固件版本与手上 OTA 不一致时的救命证据，见阶段 1）；
+2. **判定依赖 kconfig 的字段语义**。典型：`offset.selinux_enforcing` 取的是 `selinux_state`
+   的符号偏移，而 `enforcing` 只在 `CONFIG_SECURITY_SELINUX_DEVELOP=y` 时才存在、
+   才是第一个成员；`CONFIG_RANDSTRUCT_FULL=y` 还会打乱 `__randomize_layout` 结构的布局。
+   两条都不查就等于在赌。
+
+```sh
+adb pull /proc/config.gz && gunzip -c config.gz > device.config
+grep -E 'CONFIG_SECURITY_SELINUX_DEVELOP|CONFIG_RANDSTRUCT|CONFIG_RANDOMIZE_BASE|CONFIG_EFI_STUB|CONFIG_RELOCATABLE|CONFIG_ARM64_(4K|16K)_PAGES' device.config
+```
 
 **先查有没有现成的**：`app/src/main/assets/kernel_profiles/index.conf` 里搜 `uname -r`。
 命中也不等于能用 —— 去阶段 3 的 C1 做厂商判别，这正是 vivo Fold5 踩的坑。
@@ -60,6 +88,35 @@ boot 分区，extractor 已内置。只有需要留提取证据（manifest、分
 **必须记录**：OTA URL、包内 `boot` 目标分区哈希、重建出的 `boot.img` / `kernel.Image` 的
 SHA-256。重建哈希与 manifest 目标哈希一致，才算"这确实是这台机器的镜像"。
 第三方镜像站的包不可用于此步：一个被改过的镜像给出的偏移是错的，而错偏移的表现是内核内存被写坏。
+
+### 设备固件版本 ≠ 能下到的 OTA 版本（很常见）
+
+厂商下载中心通常**只挂最新一版**，而用户常因为怕漏洞被修而停在旧版。此时 `uname -r`
+往往仍然相同（厂商只动 userspace / 安全补丁标注，没重编内核），于是 profile 会被选中，
+踩的正是不变量 1。
+
+不要就这么跑，也不要为了对齐而让用户升级（升级可能真把原语修掉）。先论证内核二进制同一：
+
+```sh
+adb pull /proc/config.gz && gunzip -c config.gz > device.config
+# 镜像内嵌的同一份 config：IKCFG_ST…IKCFG_ED 之间的 gzip 块
+python3 -I - kernel.Image image.config <<'EOF'
+import sys, gzip
+img = open(sys.argv[1],'rb').read()
+st, ed = img.find(b'IKCFG_ST'), img.find(b'IKCFG_ED')
+open(sys.argv[2],'wb').write(gzip.decompress(img[st+8:ed]))
+EOF
+cmp device.config image.config && echo IDENTICAL
+```
+
+config 逐字节相同 + `uname -r` + `/proc/version` 的构建时间戳 + GKI `ab` 号四项全同，
+才可以继续，并在记录里写明这是**强证据而非证明**（config 只是构建输入的一个子集）。
+真正的证明需要哈希设备自己的 `boot` 分区（要 root）。
+
+> 实例：ROG 9 Pro 国行设备在 `36.0810.1810.84`（补丁 2026-05-01），官方只剩
+> `.86`（补丁 2026-08-05），`.84` 的包 CDN 已 404。两者 `uname -r`、构建时间戳
+> `Fri May 22 09:40:40 UTC 2026`、`ab15480978` 与 config（211 778 B）全部相同 ——
+> ASUS 只改了 userspace 的补丁标注，没重编内核。这也解释了为什么 `.86` 里原语还在。
 
 ## 阶段 2 · 生成候选 profile
 
@@ -174,6 +231,34 @@ nm vmlinux.elf | grep -wE '_text|init_task|init_cred|empty_zero_page|root_task_g
 | `child is root!` / `exploit complete` | 在 handoff **之前**打印，不能当终点（收早了会打断 ksu 加载） |
 | 喷洒阶段中止 | 此时**尚无任何内核写入**，设备安全，秒级重试 |
 | route 内卡死 | 整机僵住 → 看门狗复位，约 1 分钟 |
+| **`route_done success=1` 却 `W1: SELinux attempt N/N` 全败** | **原语可用但写偏了**，见下 |
+
+#### `route` 成功而 `W1` 失败 —— 单独一类，别当成不稳定
+
+```
+prepare_kernel_page ok attempt=1
+route_done status=0 clean=1/1 step=0 errno=0 calls=1 success=1    ← route 自报成功
+W1: SELinux attempt 15/15
+[-] Write 1 failed
+```
+
+这不是概率问题（15/15 稳定失败），是**地址错**。W1 写 `selinux_state.enforcing := 0`
+然后从用户态读 SELinux 实际状态来验（`victim_process.cpp:204` → `attack::check_selinux_off()`），
+所以"写了但状态没变"= 那一字节落在别处。按下面顺序排，每步都留证据：
+
+1. **把地址链路算一遍，和日志里的 `target=` 对比。**
+   `address_space.cpp` 的 `data_alias_checked()`：
+   `physical = kernel_phys_load + (image_addr − KIMAGE_TEXT_BASE)`，
+   `direct = (physical − phys_offset) | P0_PAGE_OFFSET`。
+   先确认 `KIMAGE_TEXT_BASE`（`target_constants.hpp`，当前 `0xffffffc080000000`）
+   **等于本镜像的 `_text`** —— 不等就是整类偏移全错。
+2. **`phys_offset` 从哪来**：profile 的 `kernel_phys_offset`，缺失则用编译默认
+   `P0_PHYS_OFFSET`。别猜，跑 `scripts/xbl_memory_map.py`（见下）。
+3. **字段语义对不对**：`selinux_enforcing` 依赖 `CONFIG_SECURITY_SELINUX_DEVELOP`
+   与 `CONFIG_RANDSTRUCT`，查 `/proc/config.gz`（阶段 0）。
+4. **`success=1` 到底证明了什么**：ANC-02 记「`ROUTE_OK` 只由 consumer 的验证写入决定」。
+   若那个验证写的是 scratch 位置而非本次 target，则它只证明原语可用，**不**证明 target 落地。
+5. 以上全对还失败 → 怀疑**内核物理落点与 `kernel_phys_load` 不一致**（陷阱 T9 的第二半）。
 
 单次 PASS ≠ 稳定。同配置跑满约 15 次之前，成功率的变化都按噪声处理。
 
@@ -199,12 +284,49 @@ jq . app/src/main/assets/kernel_profiles/index.conf
 |---|---|---|---|
 | T1 | 同 `uname -r` 不同厂商二进制 | C1 的符号 diff | 独立 profile；上游需要型号/固件身份参与匹配才能内置 |
 | T2 | 符号偏移里预加了成员偏移（或成员偏移缺失） | C4 | 两键各自独立；缺则 fail-closed，现象是"root 成功但防护未中和" |
-| T3 | `+pgo +bolt +lto` 构建 | 阶段 0 的 `/proc/version` | `select_stack` 栈几何静态不可达（上游 #112 `delta=-216`、#53），别试；6.1 上 TCP 几何经反汇编确认精确命中 |
+| T3 | `+pgo +bolt +lto` 构建 | 阶段 0 的 `/proc/version` | **先跑 `--analysis` 看 `pselect chain` 有没有 derived，不要据此直接放弃 `select_stack`。** 上游 #112（`delta=-216`）/#53 是在**那些具体内核**上静态不可达；6.6 实测相反 —— ROG 9 Pro 的 `6.6.127`（`+pgo +bolt +lto +mlgo`）推出了 `shift=-2`，且仓库 24 份 6.6.x profile 全部用 `select_stack` 且 `waiter_shift` 全为 `-2`。6.1 上 TCP 几何经反汇编确认精确命中 |
 | T4 | 硬改 `kernelsnitch.mm_struct_sz` | — | 不动（上游 #326：会把安全失败变成 kernel panic） |
 | T5 | `--allow-missing` 的 0 进了 profile | 搜候选里的 `= 0` | 未解析符号被写成 0，看着像填好了。用不到的 route 字段整条省掉，不写 0 或占位值（`PROFILE_SCHEMA.md` §2） |
 | T6 | 用第三方镜像站的包提取 | 阶段 1 的哈希链 | 只用能与 OTA manifest 目标哈希对上的镜像 |
 | T7 | 只看源 conf、不看生效快照 | 对比设备上的 `profile.conf` | app 会补 `execution` 默认值；差异必须能逐项解释 |
-| T8 | 非正常复位回滚设备侧日志 | 日志尾部出现 NUL / 内容回退 | f2fs checkpoint 行为；关键日志流到主机，别只存设备 |
+| T8 | 非正常复位回滚设备侧日志 | 日志尾部出现 NUL / 内容回退 | f2fs checkpoint 行为；关键日志流到主机，别只存设备。用 `scripts/gate_watch.sh`（见下），它带落盘预检和复位自动重连 |
+| T9 | `kernel_phys_offset` 缺失 → 悄悄用编译默认 `P0_PHYS_OFFSET`（`0x80000000`） | `address_space.cpp:86`；日志里的 `target=` 反推 | 未 root 时 `/proc/iomem` 和 `/proc/device-tree/*/reg` 都读不到，**但不要猜也不要照抄别家 profile**：跑 `scripts/xbl_memory_map.py <xbl_config.img>` 把 bootloader 的整张内存图读出来。最低区段基址就是 `kernel_phys_offset` 候选，同时能独立印证 `kernel_phys_load`。<br>注意**两件不同的事**：①`phys_offset`（DRAM 基址）对不对；②`kernel_phys_load` 是否等于内核**实际运行**的物理基址 —— `CONFIG_RANDOMIZE_BASE=y` + `CONFIG_EFI_STUB=y`（高通 XBL 即 UEFI）下 EFI stub 可能把 Image 搬到随机物理地址，那时 bootloader 的静态保留区**不是**运行地址。②目前只有 root 后的 `/proc/iomem`（`--iomem <dump>`，看 `Kernel code` 起始）能判 |
+| T10 | app 与 extractor 不同分支 → profile 被判 `unknown top-level key` | app 报"配置需要修正"，而几何字段其实都在 | 两者必须来自**同一分支**。实例：vr.ko 中和（`recommend_vr_guard` / `vr_guard`）只在上游 `vr-ko-bypass-dev`，官方 `pre-release` 的 APK 是从 `main` 构建的，`ProfileResolver.KnownTopLevel` 里没有这两个键 → `validateMerged` 报错拦住运行。要么用同分支自建 APK（CI `workflow_dispatch` 即可，不必本地装 SDK/NDK），要么另存一份去掉该段的变体 conf |
+| T11 | 把编辑器显示的 `null` 行当成"必须填的错误" | 对照 `ProfileResolver` 的 `RequiredTopLevel` / `RequiredTaskStruct` / `RequiredCred` / `RequiredOffset` 四张清单 | app 会把 profile **未携带**的字段渲染成可编辑的 `null` 行（`AndroidProfileConfigController` 里 `completeProfileFields` 的注释写明了）。`kernel_phys_offset`、`kernelsnitch.mm_struct_sz`、`cred.usage_offset`、`cred.refN_*` 都属于这一类 —— **不在必填清单里，填进去反而写入错值**。真正被拦住的只看日志的 `invalid=` 和红色标记 |
+
+## 随带脚本
+
+两个都在 `scripts/`，只读、不需要 root、不驱动 exploit。
+
+### `xbl_memory_map.py` — 取 `kernel_phys_offset` 候选（高通）
+
+```sh
+python3 -I scripts/xbl_memory_map.py rog9_xbl/xbl_config.img
+```
+
+把 xbl_config 里**所有**内嵌 FDT 的 `memorymap` 节点读出来（extractor 的 `fdt.rs` 解析
+同一张表，但只返回 Kernel 行）。输出整张表 + 最低区段基址（`kernel_phys_offset` 候选）
++ Kernel 行（交叉印证 `kernel_phys_load`）。
+
+这是未 root 时唯一的静态来源：`/proc/iomem` 要 root，`/proc/device-tree/*/reg`
+被 SELinux 挡住。**但最低基址只是候选** —— Linux 的 `PHYS_OFFSET` 取自它自己 DT
+`/memory` 节点的第一个 memblock，不一定是 bootloader 列出的最低行。标注为候选，
+拿到 root 后用 `ghostlock-extract --iomem <dump>` 确认。
+
+### `gate_watch.sh` — 阶段 4 的主机侧记录器（app 流程）
+
+```sh
+GL_CONF=~/Downloads/<uname-r>.conf bash scripts/gate_watch.sh cold-boot-1
+```
+
+只读前置检查（从 conf 的 `release` 字段取期望 `uname -r` 并逐字符核对、conf 哈希本地 vs 设备、
+管理器 app 是否在位、KernelSU 是否已加载、启动时长是否像冷机）→ logcat 流式落盘
+**并预检确认真的在涨** → 设备复位自动重连 → Ctrl-C 收尾时自动拉设备侧
+`ghostlock-debug-log/`、diff 生效 `profile.conf`（陷阱 T7）、打印关键行摘要。
+
+CLI 流程（`--load-prebuilt-profile`）不要用它：那边脚本是父进程，可以在
+`prepare_kernel_page retry` 处就地 abort 重摇；app 流程里控制权不在脚本手里。
+**两个流程的 uid / seccomp / W3 都不同，成功率不能互比。**
 
 ## 交付物清单
 
