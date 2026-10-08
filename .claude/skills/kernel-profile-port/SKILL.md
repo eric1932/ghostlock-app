@@ -48,6 +48,17 @@ adb shell ls -l /sys/kernel/btf/vmlinux        # 可读则可在真机侧交叉�
 3. 高通机型另备 `xbl_config.img`（推 `kernel_phys_load`）；没有 FDT 内存图时用 `uefi.img`。
    联发科镜像通常两者都没有，靠 kallsyms `_text` 推，必要时 `--phys` 手动指定。
 
+### 怎么拿到官方直链
+
+各家入口不同，但都是「厂商下载接口 → 固件 ZIP 直链」两步，脚本化即可：
+
+- **ASUS（ROG / ZenFone）**：`references/asus-firmware-url.sh "<机型名>" [cn|global]`。
+  国行必须走 `.com.cn` 三件套（`odinapi.asus.com.cn` → `www.asus.com.cn/support/webapi/ProductV2/GetPDBIOS`
+  → `dlcdnets.asus.com.cn`），与全球站是不同的产品 ID 空间。
+- **其他厂商**：先找「机型 → 版本列表 → 直链」的那个接口，拿到的 URL 直接交给 extractor。
+  厂商专用的只有「怎么查到 URL」这一步；**拿到 URL 之后的远程 Range 提取 extractor 已内置**，
+  不需要再写一遍抓包脚本。
+
 **必须记录**：OTA URL、包内 `boot` 目标分区哈希、重建出的 `boot.img` / `kernel.Image` 的
 SHA-256。重建哈希与 manifest 目标哈希一致，才算"这确实是这台机器的镜像"。
 第三方镜像站的包不可用于此步：一个被改过的镜像给出的偏移是错的，而错偏移的表现是内核内存被写坏。
