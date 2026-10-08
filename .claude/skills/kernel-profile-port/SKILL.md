@@ -122,13 +122,39 @@ profile 不能预先加好。典型：
 - 实际目标由 native 算：`src/core/session/ancillary/vr_guard.hpp:43` 的
   `plan_vr_guard()` → `image_offset = vr_sys_exit_tp + tracepoint_funcs`。
 
-所以手工往 `vr_sys_exit_tp` 里加 0x40 会**双加**，落到 `funcs` 之后的成员上。
-反过来，`tracepoint_funcs` 缺失时 `plan_vr_guard()` 返回 `nullopt`，guard **fail-closed 静默不执行**。
-两种错法的现象都是：**root 拿到了、KernelSU 也加载了，但 vr.ko 从未被中和，几分钟后 UI 冻死**。
-这跟 exploit 不稳定长得一模一样，但不是一回事。
+三种错法，现象完全一样：**root 拿到了、KernelSU 也加载了，但 vr.ko 从未被中和，
+几分钟后 UI 冻死**。这跟 exploit 不稳定长得一模一样，但不是一回事。
 
-核对方式：确认 extractor 输出的这两个键各自独立存在；拿 `nm` / 反汇编查 `__tracepoint_sys_exit`
-的裸地址，与 profile 值相等（不是相差 0x40）。
+| 错法 | 后果 |
+|---|---|
+| 往 `vr_sys_exit_tp` 预加了 `funcs` 偏移 | 双加，落到 `struct tracepoint` 之外 |
+| `tracepoint_funcs` 缺失 | `plan_vr_guard()` 返回 `nullopt`，guard fail-closed 静默不执行 |
+| 符号本身取偏了 | 写进**邻居 tracepoint** 的结构里 |
+
+第三种最阴，因为"差一点"看着很合理。PD2436（6.1.145）实测：
+
+```
+__tracepoint_sys_enter  image off 0x23cb178
+__tracepoint_sys_exit   image off 0x23cb1c0    # 相距 0x48 = sizeof(struct tracepoint)
+                                               # funcs 是最后一个成员，位于 +0x40
+native 实际写入       = 0x23cb1c0 + 0x40 = 0x23cb200
+```
+
+所以 `vr_sys_exit_tp` 写成 `0x23cb180` 只比正确值低 0x40，但那个地址落在
+**sys_enter 的 struct 里**，guard 写了也白写。`0x48` 的结构步长 + `0x40` 的成员偏移
+正好让"差 0x40"显得像个合理的候选值 —— 不要靠眼力，要靠符号表精确相等。
+
+### C5 · 用符号表把每个 `offset.*` 重算一遍
+
+手改过或导入来的 profile 必须过这一步（C1 的 diff 只能和另一份内置比，比不出手改的错）。
+拿这台机器自己的 `vmlinux` / 恢复出的 ELF：
+
+```sh
+nm vmlinux.elf | grep -wE '_text|init_task|init_cred|empty_zero_page|root_task_group|selinux_blob_sizes|security_hook_heads|__tracepoint_sys_exit'
+```
+
+对每个符号算 `image_off = vaddr - _text`，要求与 profile 里的值**精确相等**，不接受"接近"。
+符号表里查不到的（如 `selinux_enforcing` 常是 local 符号）另途核对，不要跳过。
 
 ## 阶段 4 · 真机门禁
 
