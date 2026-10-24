@@ -609,7 +609,7 @@ namespace ghostlock::support {
         /* mm_structs live in the direct map */
         if (leaked == static_cast<uintptr_t>(-1) ||
             leaked < kernel::KERNELSNITCH_IDENTITY_START ||
-            leaked >= kernel::g_direct_map_end) {
+            leaked >= kernel::direct_map_scan_end()) {
             pr_warning("KernelSnitch mm_struct leak failed\n");
             snitch.reset();
             for (size_t i = 0; i < prepare_ctx.childs.size(); i++) {

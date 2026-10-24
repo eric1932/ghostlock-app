@@ -307,10 +307,11 @@ namespace ghostlock::kernelsnitch {
  * rescanning an earlier one. */
     static void __run_mm_leak_pass(struct kernelsnitch_shared_state *ks, int32_t try_canonical,
                                    int32_t sweep_tags, size_t lo, size_t hi) {
-        /* the leak check discards a match past the measured end, so no slice
-     * scans past it */
-        const size_t ceiling = std::min<uint64_t>(ghostlock::kernel::g_direct_map_end,
-                                                  static_cast<uint64_t>(hi));
+        /* hi is the caller's decision; clamping again here would silently undo
+     * it -- that is exactly how the first version of this patch capped stage 2
+     * at the unmeasured g_direct_map_end default instead of the linear-region
+     * end. The caller owns the bound, support/util.cpp accepts the same one. */
+        const size_t ceiling = hi;
         if (ceiling <= lo || ks->thread_cnt == 0)
             return;
         const size_t diff = (ceiling - lo) / ks->thread_cnt;
@@ -677,12 +678,7 @@ namespace ghostlock::kernelsnitch {
      * attack/ops.hpp keeps using the unmodified DIRECT_MAP_END. */
         const size_t stage1 = std::min<uint64_t>(ghostlock::kernel::g_direct_map_end,
                                                  static_cast<uint64_t>(IDENTITY_END));
-        const int32_t measured =
-                ghostlock::kernel::g_direct_map_end != ghostlock::kernel::DIRECT_MAP_END;
-        const size_t stage2 = measured
-                                  ? std::min<uint64_t>(ghostlock::kernel::g_direct_map_end,
-                                                       static_cast<uint64_t>(LINEAR_END))
-                                  : static_cast<size_t>(LINEAR_END);
+        const size_t stage2 = static_cast<size_t>(ghostlock::kernel::direct_map_scan_end());
 
         __run_mm_leak_pass(ks, 1, 0, IDENTITY_START, stage1);
         if (!ks->found)
