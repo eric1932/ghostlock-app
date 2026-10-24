@@ -65,7 +65,10 @@ namespace ghostlock::kernel {
  * The slice bounds are the only runtime confirmation that a scan-window change
  * took effect, so a build that changes the window should enable this. */
 #ifndef GHOSTLOCK_KERNELSNITCH_VERBOSE
-#define GHOSTLOCK_KERNELSNITCH_VERBOSE 0
+/* 1 on this branch only: the CI build runs plain `make -C src ghostlock`, so the
+ * verbose tracing has to be the default to reach the artifact. Do not upstream
+ * this hunk -- the previous commit's opt-in default of 0 is the right one. */
+#define GHOSTLOCK_KERNELSNITCH_VERBOSE 1
 #endif
 
 namespace ghostlock::kernelsnitch {
