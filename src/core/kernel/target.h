@@ -23,6 +23,8 @@ namespace ghostlock::kernel {
             target::address::kKernelSnitchIdentityStart;
     inline constexpr std::uintptr_t KERNELSNITCH_IDENTITY_END =
             target::address::kKernelSnitchIdentityEnd;
+    inline constexpr std::uintptr_t KERNELSNITCH_LINEAR_END =
+            target::address::kKernelSnitchLinearEnd;
     inline constexpr std::uintptr_t DIRECT_MAP_BASE = target::address::kDirectMapBase;
     inline constexpr std::uintptr_t DIRECT_MAP_END = target::address::kDirectMapEnd;
     inline constexpr std::uintptr_t VMEMMAP_START = target::address::kVmemmapStart;

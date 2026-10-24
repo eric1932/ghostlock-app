@@ -502,7 +502,8 @@ namespace ghostlock::support {
         int32_t cpu_count = static_cast<int32_t>(sysconf(_SC_NPROCESSORS_ONLN));
         kernelsnitch::KernelSnitchOwner snitch = kernelsnitch::KernelSnitchOwner::create(
             session::g_exploit_session.profile.mm_struct_stride(kernel::MM_STRUCT_SZ),
-            kernel::MM_ORDER, static_cast<size_t>(cpu_count), ghostlock::profile::kernelsnitch_collisions(), 0,
+            kernel::MM_ORDER, static_cast<size_t>(cpu_count), ghostlock::profile::kernelsnitch_collisions(),
+            GHOSTLOCK_KERNELSNITCH_VERBOSE,
             static_cast<size_t>(config::runtime_config_snapshot().main_cpu));
         /* The forked leak child borrows the shared mmap context through this
          * compatibility alias; the owner remains the only releaser. */
